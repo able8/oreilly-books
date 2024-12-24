@@ -7,7 +7,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
+	"time"
 )
 
 type Response struct {
@@ -44,33 +46,44 @@ const (
 func main() {
 	baseURL := fmt.Sprintf("https://www.oreilly.com/search/api/search/?q=*&type=book&order_by=published_at&rows=%d&language=en&page=", pageSize)
 
-	done := make(chan struct{})
-
+	var allProducts []Product
 	var wg sync.WaitGroup
 	productsChan := make(chan []Product, maxConcurrent)
 
-	wg.Add(1)
-
 	// Fetch data concurrently
-	go fetchProducts(baseURL, pageMax, &wg, productsChan)
-
+	wg.Add(1)
 	go func() {
-		if err := writeCSV("oreilly-book-list.csv", productsChan); err != nil {
-			log.Fatalf("Error writing CSV: %v", err)
-		}
-		done <- struct{}{}
+		defer wg.Done()
+		fetchProducts(baseURL, pageMax, &wg, productsChan)
+		close(productsChan)
 	}()
 
-	// Close the channel once all goroutines are done
-	wg.Wait()
-	close(productsChan)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for products := range productsChan {
+			allProducts = append(allProducts, products...)
+		}
+	}()
 
-	<-done
-	fmt.Println("Data successfully written to oreilly_books.csv")
+	wg.Wait()
+
+	fileDate := time.Now().Format("2006-01-02")
+	csvFilename := fmt.Sprintf("oreilly-book-list-%s.csv", fileDate)
+	markdownFilename := fmt.Sprintf("oreilly-book-list-%s.md", fileDate)
+
+	if err := writeCSV(csvFilename, allProducts); err != nil {
+		log.Fatalf("Error writing CSV: %v", err)
+	}
+
+	if err := writeMarkdown(markdownFilename, allProducts); err != nil {
+		log.Fatalf("Error writing Markdown: %v", err)
+	}
+
+	fmt.Println("Done.")
 }
 
 func fetchProducts(baseURL string, pageMax int, wg *sync.WaitGroup, productsChan chan<- []Product) {
-	defer wg.Done()
 	sem := make(chan struct{}, maxConcurrent) // Semaphore to limit concurrency
 
 	for page := 0; page < pageMax; page++ {
@@ -120,7 +133,7 @@ func fetchData(apiURL string) (Response, error) {
 	return response, nil
 }
 
-func writeCSV(filename string, productsChan chan []Product) error {
+func writeCSV(filename string, products []Product) error {
 	file, err := os.Create(filename)
 	if err != nil {
 		return err
@@ -137,25 +150,61 @@ func writeCSV(filename string, productsChan chan []Product) error {
 	}
 
 	// Write product data to CSV
-	for products := range productsChan {
-		for _, product := range products {
-			categories := formatCategories(product.Categories)
-			row := []string{
-				product.Title,
-				product.CustomAttributes.PublicationDate,
-				product.URL,
-				product.Type,
-				product.Language,
-				categories,
-				product.CoverImage,
-				fmt.Sprintf("%v", product.CustomAttributes.Publishers),
-				fmt.Sprintf("%v", product.Authors),
-			}
-			if err := writer.Write(row); err != nil {
-				return err
-			}
+	for _, product := range products {
+		categories := formatCategories(product.Categories)
+		row := []string{
+			product.Title,
+			product.CustomAttributes.PublicationDate,
+			product.URL,
+			product.Type,
+			product.Language,
+			categories,
+			product.CoverImage,
+			fmt.Sprintf("%v", product.CustomAttributes.Publishers),
+			fmt.Sprintf("%v", product.Authors),
 		}
+		if err := writer.Write(row); err != nil {
+			return err
+		}
+	}
 
+	return nil
+}
+
+// writeMarkdown writes product data to a Markdown file
+func writeMarkdown(filename string, products []Product) error {
+	file, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// Write Markdown header
+	header := []string{"Title", "Publication Date", "Categories"}
+	_, err = file.WriteString("| " + strings.Join(header, " | ") + " |\n")
+	if err != nil {
+		return err
+	}
+
+	// Write Markdown separator
+	separator := make([]string, len(header))
+	for i := range separator {
+		separator[i] = "---"
+	}
+	_, err = file.WriteString("| " + strings.Join(separator, " | ") + " |\n")
+	if err != nil {
+		return err
+	}
+
+	// Write product data to Markdown
+	for _, product := range products {
+		categories := formatCategories(product.Categories)
+
+		item := fmt.Sprintf("| [%s](%s) | %s | %s |\n", product.Title, product.URL, product.CustomAttributes.PublicationDate, categories)
+		_, err := file.WriteString(item)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
